@@ -1,9 +1,23 @@
 """
-Spec Generation Worker (Phase 6)
-Converts natural language to app specification using LLM
+Spec Generation Worker
+
+Turns a natural-language request into an Android app specification.
+
+Ingredient-branding step ("Powered by RPCS-1"): before spec generation, the raw
+request is run through the live RPCS-1 translation bridge (rpcs1.dev) `interpret`
+tool, which disambiguates the human request into a canonical intent plus entities,
+a confidence score, and clarifying questions. nl2build then generates the spec
+from that cleaner intent, and records RPCS-1 provenance on the spec so the value
+RPCS-1 added is visible and measurable (not silent plumbing).
+
+If the RPCS-1 service is unreachable, we degrade gracefully to the raw prompt and
+mark the provenance disabled — the pipeline never hard-depends on it.
 """
 import sys
 import os
+import json
+import urllib.request
+import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy.orm import Session
@@ -30,6 +44,37 @@ The spec should include:
 
 Return ONLY valid YAML. No markdown, no code blocks."""
 
+# "Powered by RPCS-1" intent pre-processor (rpcs1.dev translation bridge).
+RPCS1_TRANSLATE_URL = os.environ.get("RPCS1_TRANSLATE_URL", "https://rpcs1.dev/api/translate")
+RPCS1_MIN_CONFIDENCE = float(os.environ.get("RPCS1_MIN_CONFIDENCE", "0.5"))
+
+
+def rpcs1_interpret(text: str, timeout: int = 20) -> dict:
+    """Call the RPCS-1 `interpret` tool. Returns a provenance dict that always
+    includes 'enabled'; never raises (degrades gracefully)."""
+    prov = {"enabled": False, "source": RPCS1_TRANSLATE_URL}
+    try:
+        body = json.dumps({"tool": "interpret", "text": text}).encode()
+        req = urllib.request.Request(
+            RPCS1_TRANSLATE_URL, data=body, method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read())
+        prov.update({
+            "enabled": True,
+            "canonical_translation": data.get("canonical_translation") or "",
+            "confidence": data.get("confidence"),
+            "ar_level": data.get("ar_level"),
+            "translation_integrity": data.get("translation_integrity"),
+            "recovered_intent": data.get("recovered_intent"),
+            "recovered_entities": data.get("recovered_entities", []),
+            "clarifying_questions": data.get("clarifying_questions", []),
+        })
+    except Exception as e:
+        prov["error"] = str(e)
+    return prov
+
 
 def generate_spec(job_id: str) -> None:
     db: Session = SessionLocal()
@@ -43,10 +88,22 @@ def generate_spec(job_id: str) -> None:
         job.current_step = "spec_generating"
         db.commit()
 
+        # --- Powered by RPCS-1: disambiguate the request into canonical intent.
+        prov = rpcs1_interpret(job.nl_prompt)
+        effective_prompt = job.nl_prompt
+        canonical = prov.get("canonical_translation") or ""
+        if prov.get("enabled") and canonical and (prov.get("confidence") or 0) >= RPCS1_MIN_CONFIDENCE:
+            effective_prompt = canonical
+
         if settings.openai_api_key:
-            spec = generate_spec_with_llm(job.nl_prompt, job.package_name)
+            spec = generate_spec_with_llm(effective_prompt, job.package_name)
         else:
-            spec = generate_simple_spec(job.nl_prompt, job.package_name)
+            spec = generate_simple_spec(effective_prompt, job.package_name)
+
+        # Record RPCS-1 provenance on the spec (visible + measurable).
+        spec["rpcs1"] = prov
+        spec["raw_prompt"] = job.nl_prompt
+        spec["effective_prompt"] = effective_prompt
 
         job.spec = spec
         job.status = JobStatus.SPEC_GENERATED
@@ -55,7 +112,7 @@ def generate_spec(job_id: str) -> None:
 
         enqueue_codegen_job(job_id)
 
-        print(f"Spec generated for job {job_id}")
+        print(f"Spec generated for job {job_id} (rpcs1 enabled={prov.get('enabled')})")
 
     except Exception as e:
         print(f"Spec generation failed for job {job_id}: {str(e)}")
